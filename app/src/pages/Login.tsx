@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import { useState } from "react";
 
 async function post(path: string, body: any) {
   const res = await fetch(`/.netlify/functions/${path}`, {
