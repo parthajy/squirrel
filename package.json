@@ -1,0 +1,10 @@
+{
+  "name": "squirrel",
+  "private": true,
+  "workspaces": ["app", "packages/*"],
+  "scripts": {
+    "dev": "npm run -w app dev",
+    "build": "npm run -w app build",
+    "lint": "echo \"(optional)\""
+  }
+}

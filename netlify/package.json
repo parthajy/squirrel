@@ -1,0 +1,12 @@
+{
+  "name": "squirrel-functions",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.95.3",
+    "openai": "^6.18.0"
+  },
+  "devDependencies": {
+    "@netlify/functions": "^2.8.2"
+  }
+}
