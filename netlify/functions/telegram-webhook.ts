@@ -8,6 +8,13 @@ import { SQUIRREL_CLAW_SYSTEM_V1, buildClawUserPrompt, type ClawDecision } from 
 assertEnv();
 const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });
 
+function isQuery(text: string) {
+  const t = text.trim().toLowerCase();
+  if (t.startsWith("?")) return true;
+  if (t.startsWith("ask ")) return true;
+  return /(what did i|when did i|find|show|summarize|recap|search|did i|deadline|remind me)/.test(t);
+}
+
 async function telegramSend(chatId: string | number, text: string, extra?: any) {
   const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
   await fetch(url, {
@@ -109,33 +116,45 @@ async function retrieve(userId: string, query: string) {
     p_match_count: 12,
   });
   if (error) throw error;
-  return data as any[];
+
+  const rows = (data as any[]) ?? [];
+  // Expect RPC to return similarity score; if not present, we still handle gracefully.
+  const strong = rows.filter((r) => (r.similarity ?? 0) >= 0.78);
+
+  return (strong.length ? strong : rows.slice(0, 4));
 }
 
 async function answerQuery(userId: string, query: string) {
   const candidates = await retrieve(userId, query);
+
+  if (!candidates.length) {
+    return "I don’t have anything solid on that yet. Try adding more context or saving more items first.";
+  }
 
   const resp = await openai.chat.completions.create({
     model: "gpt-4.1-mini",
     temperature: 0.2,
     response_format: { type: "json_object" },
     messages: [
-      { role: "system", content: "Answer using ONLY provided memories. Output JSON: {text:string}." },
+      {
+        role: "system",
+        content:
+          "You answer using ONLY the provided memories. If the memories don't contain the answer, say you don't know. Output JSON: {text:string}.",
+      },
       { role: "user", content: JSON.stringify({ query, candidates }, null, 2) },
     ],
   });
 
   const out = JSON.parse(resp.choices[0]?.message?.content || "{}");
-  const sources =
-    candidates.length === 0
-      ? ""
-      : "\n\nSources:\n" +
-        candidates
-          .slice(0, 4)
-          .map((c: any) => `• ${c.title} (${new Date(c.created_at).toLocaleDateString()})`)
-          .join("\n");
 
-  return `${out.text || "I couldn't find that in your memories yet."}${sources}`;
+  const sources =
+    "\n\nSources:\n" +
+    candidates
+      .slice(0, 4)
+      .map((c: any) => `• ${c.title} (${new Date(c.created_at).toLocaleDateString()})`)
+      .join("\n");
+
+  return `${out.text || "I couldn’t find that in your memories yet."}${sources}`;
 }
 
 export const handler: Handler = async (event) => {
@@ -170,18 +189,28 @@ export const handler: Handler = async (event) => {
       return json(200, { ok: true });
     }
 
-    const text = msg.text || msg.caption || "";
-    const metadata = {
-      chat_id: chatId,
-      message_id: msg.message_id,
-      telegram_user_id: telegramUserId,
-      telegram_username: username ?? null,
-      date: msg.date,
-      forward_from: msg.forward_from ? { id: msg.forward_from.id, username: msg.forward_from.username } : null,
-      forward_from_chat: msg.forward_from_chat ? { id: msg.forward_from_chat.id, title: msg.forward_from_chat.title } : null,
-    };
+    const text = (msg.text || msg.caption || "").trim();
+if (!text) return json(200, { ok: true });
 
-    const decision = await clawDecide({ text, metadata });
+const metadata = {
+  chat_id: chatId,
+  message_id: msg.message_id,
+  telegram_user_id: telegramUserId,
+  telegram_username: username ?? null,
+  date: msg.date,
+  forward_from: msg.forward_from ? { id: msg.forward_from.id, username: msg.forward_from.username } : null,
+  forward_from_chat: msg.forward_from_chat ? { id: msg.forward_from_chat.id, title: msg.forward_from_chat.title } : null,
+};
+
+// ✅ If user is clearly asking, answer without Claw (cheaper + reliable)
+if (msg.text && isQuery(text)) {
+  const q = text.replace(/^\?/, "").replace(/^ask\s+/i, "").trim();
+  const ans = await answerQuery(user.id, q);
+  await telegramSend(chatId, ans);
+  return json(200, { ok: true });
+}
+
+const decision = await clawDecide({ text, metadata });
 
     if (decision.intent === "ignore") return json(200, { ok: true });
 
@@ -191,14 +220,19 @@ export const handler: Handler = async (event) => {
     }
 
     if (decision.intent === "store") {
-      await storeMemory(user.id, decision, text || null);
+  await storeMemory(user.id, decision, text || null);
 
-      // ask contact after first store if missing
-      if (!user.phone_e164) await telegramAskShareContact(chatId);
+  // ask contact after first store if missing
+  if (!user.phone_e164) await telegramAskShareContact(chatId);
 
-      if (decision.should_reply && decision.reply_text) await telegramSend(chatId, decision.reply_text);
-      return json(200, { ok: true });
-    }
+  if (decision.reply_text) {
+    await telegramSend(chatId, decision.reply_text);
+  } else {
+    await telegramSend(chatId, "✅ Saved.");
+  }
+
+  return json(200, { ok: true });
+}
 
     if (decision.intent === "query") {
       const ans = await answerQuery(user.id, decision.query || text);
