@@ -10,43 +10,49 @@ function genOtp() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
 
+function normalizeE164(raw: string) {
+  const t = String(raw || "").trim();
+  if (!t) return "";
+  if (t.startsWith("+")) return `+${t.replace(/[^\d]/g, "")}`; // keep +
+  return `+${t.replace(/[^\d]/g, "")}`;
+}
+
 export const handler: Handler = async (event) => {
   try {
     const body = JSON.parse(event.body || "{}");
-    const phone = String(body.phone_e164 || "").trim();
-    if (!phone.startsWith("+")) return json(400, { error: "phone_e164 must be in +E164 format" });
+    const phone_e164 = normalizeE164(body.phone_e164);
+    if (!phone_e164 || phone_e164.length < 8) return json(400, { error: "invalid_phone" });
 
-    // Ensure user exists (create-on-first-contact philosophy)
-    // If you want to link Telegram->phone, you already store phone on squirrel_users.
+    // Ensure a user exists (create-on-first-login is OK for your model)
     const { data: user, error: uerr } = await adminSupabase
       .from("squirrel_users")
-      .select("*")
-      .eq("phone_e164", phone)
+      .select("id, phone_e164")
+      .eq("phone_e164", phone_e164)
       .maybeSingle();
 
     if (uerr) throw uerr;
+
     if (!user) {
-      // Create a minimal user row so OTP login always works
       const { error: ierr } = await adminSupabase.from("squirrel_users").insert({
-        phone_e164: phone,
+        phone_e164,
         last_seen_at: new Date().toISOString(),
       });
       if (ierr) throw ierr;
     }
 
     const otp = genOtp();
-    const expiresAt = new Date(Date.now() + Number(env.OTP_TTL_MINUTES) * 60_000).toISOString();
+    const expires_at = new Date(Date.now() + Number(env.OTP_TTL_MINUTES) * 60_000).toISOString();
 
-    // Store OTP (hash later; plaintext is ok for MVP but don’t log it)
-    const { error } = await adminSupabase.from("squirrel_otps").insert({
-      phone_e164: phone,
+    // Store challenge
+    const { error } = await adminSupabase.from("squirrel_otp_challenges").insert({
+      phone_e164,
       otp,
-      expires_at: expiresAt,
+      expires_at,
       used: false,
     });
     if (error) throw error;
 
-    await sendOtpSms(phone, otp);
+    await sendOtpSms(phone_e164, otp);
     return json(200, { ok: true });
   } catch (e: any) {
     console.error("auth-request-otp error", e);
