@@ -1,88 +1,75 @@
 import type { Handler } from "@netlify/functions";
 import { adminSupabase } from "./_lib/supabase";
-import { env } from "./_lib/env";
+import { env, assertEnv } from "./_lib/env";
 import { json } from "./_lib/http";
-import { sha256, randomToken, normalizePhoneToE164 } from "./_lib/crypto";
 
-function cookieHeader(token: string) {
-  const maxAge = env.SESSION_DAYS * 24 * 60 * 60;
-  // secure should be true on https (Netlify is https)
-  return `${env.SESSION_COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`;
+assertEnv();
+
+function randomToken(len = 48) {
+  const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  return Array.from({ length: len }, () => chars[Math.floor(Math.random() * chars.length)]).join("");
 }
 
 export const handler: Handler = async (event) => {
   try {
     const body = JSON.parse(event.body || "{}");
-    const phone = normalizePhoneToE164(String(body.phone || ""));
+    const phone = String(body.phone_e164 || "").trim();
     const otp = String(body.otp || "").trim();
 
-    if (!/^\d{6}$/.test(otp)) return json(400, { ok: false, error: "invalid_otp" });
+    if (!phone.startsWith("+") || otp.length < 4) return json(400, { error: "invalid_input" });
 
-    // Get latest active challenge
-    const { data: chal, error: chalErr } = await adminSupabase
-      .from("squirrel_otp_challenges")
+    // Find latest valid OTP
+    const { data: rows, error } = await adminSupabase
+      .from("squirrel_otps")
       .select("*")
       .eq("phone_e164", phone)
-      .is("consumed_at", null)
-      .gt("expires_at", new Date().toISOString())
+      .eq("otp", otp)
+      .eq("used", false)
       .order("created_at", { ascending: false })
-      .limit(1)
+      .limit(1);
+
+    if (error) throw error;
+    const row = rows?.[0];
+    if (!row) return json(401, { error: "invalid_otp" });
+
+    if (new Date(row.expires_at).getTime() < Date.now()) return json(401, { error: "expired_otp" });
+
+    // Mark used
+    await adminSupabase.from("squirrel_otps").update({ used: true }).eq("id", row.id);
+
+    // Fetch user
+    const { data: user, error: uerr } = await adminSupabase
+      .from("squirrel_users")
+      .select("*")
+      .eq("phone_e164", phone)
       .maybeSingle();
-
-    if (chalErr) throw chalErr;
-    if (!chal) return json(400, { ok: false, error: "otp_expired" });
-
-    // attempts check
-    if (chal.attempts >= 5) return json(429, { ok: false, error: "too_many_attempts" });
-
-    const otpHash = sha256(otp);
-    const ok = otpHash === chal.otp_hash;
-
-    // increment attempts always
-    await adminSupabase.from("squirrel_otp_challenges").update({ attempts: chal.attempts + 1 }).eq("id", chal.id);
-
-    if (!ok) return json(400, { ok: false, error: "wrong_otp" });
-
-    // Consume
-    await adminSupabase.from("squirrel_otp_challenges").update({ consumed_at: new Date().toISOString() }).eq("id", chal.id);
-
-    // Find or create user by phone
-    let user = await adminSupabase.from("squirrel_users").select("*").eq("phone_e164", phone).maybeSingle();
-    if (user.error) throw user.error;
-
-    if (!user.data) {
-      const created = await adminSupabase
-        .from("squirrel_users")
-        .insert({ phone_e164: phone, last_seen_at: new Date().toISOString() })
-        .select("*")
-        .single();
-      if (created.error) throw created.error;
-      user = { data: created.data, error: null };
-    } else {
-      await adminSupabase.from("squirrel_users").update({ last_seen_at: new Date().toISOString() }).eq("id", user.data.id);
-    }
+    if (uerr) throw uerr;
+    if (!user) return json(401, { error: "no_user" });
 
     // Create session
-    const token = randomToken(32);
-    const tokenHash = sha256(token);
-    const expiresAt = new Date(Date.now() + env.SESSION_DAYS * 24 * 60 * 60 * 1000).toISOString();
+    const token = randomToken();
+    const expiresAt = new Date(Date.now() + Number(env.SESSION_DAYS) * 24 * 60 * 60 * 1000).toISOString();
 
-    const { error: sessErr } = await adminSupabase.from("squirrel_sessions").insert({
-      user_id: user.data.id,
-      token_hash: tokenHash,
+    const { error: serr } = await adminSupabase.from("squirrel_sessions").insert({
+      user_id: user.id,
+      token,
       expires_at: expiresAt,
     });
-    if (sessErr) throw sessErr;
+    if (serr) throw serr;
 
-    return json(
-      200,
-      { ok: true },
-      {
-        "set-cookie": cookieHeader(token),
-      }
-    );
+    // httpOnly cookie
+    return {
+      statusCode: 200,
+      headers: {
+        "content-type": "application/json",
+        "set-cookie": `${env.SESSION_COOKIE_NAME}=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${Number(
+          env.SESSION_DAYS
+        ) * 24 * 60 * 60}`,
+      },
+      body: JSON.stringify({ ok: true }),
+    };
   } catch (e: any) {
-    console.error("auth-verify-otp", e);
-    return json(400, { ok: false, error: e.message || "bad_request" });
+    console.error("auth-verify-otp error", e);
+    return json(500, { error: "otp_verify_failed" });
   }
 };
