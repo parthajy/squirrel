@@ -7,7 +7,13 @@ async function post(path: string, body: any) {
     credentials: "include",
     body: JSON.stringify(body),
   });
-  return res.json();
+
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { ok: false, error: text || `HTTP ${res.status}` };
+  }
 }
 
 export default function Login() {
@@ -32,7 +38,7 @@ export default function Login() {
           <button
             onClick={async () => {
               setErr(null);
-              const r = await post("auth-request-otp", { phone });
+              const r = await post("auth-request-otp", { phone_e164: phone });
               if (!r.ok) return setErr(r.error || "Failed");
               setStep("otp");
             }}
@@ -54,7 +60,7 @@ export default function Login() {
           <button
             onClick={async () => {
               setErr(null);
-              const r = await post("auth-verify-otp", { phone, otp });
+              const r = await post("auth-verify-otp", { phone_e164: phone, otp });
               if (!r.ok) return setErr(r.error || "Failed");
               window.location.href = "/";
             }}
