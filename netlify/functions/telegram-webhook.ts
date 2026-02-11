@@ -1,5 +1,6 @@
 import type { Handler } from "@netlify/functions";
 import OpenAI from "openai";
+import pdfParse from "pdf-parse";
 import { adminSupabase } from "./_lib/supabase";
 import { env, assertEnv } from "./_lib/env";
 import { json } from "./_lib/http";
@@ -13,6 +14,62 @@ function isQuery(text: string) {
   if (t.startsWith("?")) return true;
   if (t.startsWith("ask ")) return true;
   return /(what did i|when did i|find|show|summarize|recap|search|did i|deadline|remind me)/.test(t);
+}
+
+async function telegramGetFileUrl(fileId: string): Promise<string | null> {
+  const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ file_id: fileId }),
+  });
+  const j: any = await r.json();
+  const filePath = j?.result?.file_path;
+  if (!filePath) return null;
+  return `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${filePath}`;
+}
+
+async function downloadBuffer(url: string): Promise<Buffer> {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`download failed ${r.status}`);
+  const ab = await r.arrayBuffer();
+  return Buffer.from(ab);
+}
+
+// Best-effort image caption. If vision fails, returns null (and we still store the image URL).
+async function captionImageUrl(url: string): Promise<string | null> {
+  try {
+    // Uses Responses API if available in your openai version
+    // If not available at runtime, catch and return null.
+    const resp: any = await (openai as any).responses.create({
+      model: "gpt-4.1-mini",
+      input: [
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: "Write a short caption of what this image shows. Be specific. 1-2 sentences." },
+            { type: "input_image", image_url: url },
+          ],
+        },
+      ],
+    });
+    const text = resp?.output_text;
+    return typeof text === "string" && text.trim() ? text.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+async function extractPdfTextFromUrl(url: string): Promise<string | null> {
+  try {
+    const buf = await downloadBuffer(url);
+    const out: any = await pdfParse(buf);
+    const text = String(out?.text || "").trim();
+    if (!text) return null;
+    // Keep it bounded so embeddings + claw don’t explode
+    return text.slice(0, 12000);
+  } catch {
+    return null;
+  }
 }
 
 async function telegramSend(chatId: string | number, text: string, extra?: any) {
@@ -118,17 +175,15 @@ async function retrieve(userId: string, query: string) {
   if (error) throw error;
 
   const rows = (data as any[]) ?? [];
-  // Expect RPC to return similarity score; if not present, we still handle gracefully.
   const strong = rows.filter((r) => (r.similarity ?? 0) >= 0.78);
-
-  return (strong.length ? strong : rows.slice(0, 4));
+  return strong.length ? strong : rows.slice(0, 4);
 }
 
 async function answerQuery(userId: string, query: string) {
   const candidates = await retrieve(userId, query);
 
   if (!candidates.length) {
-    return "I don’t have anything solid on that yet. Try adding more context or saving more items first.";
+    return "I don’t have anything solid on that yet. Save a bit more context and try again.";
   }
 
   const resp = await openai.chat.completions.create({
@@ -139,14 +194,13 @@ async function answerQuery(userId: string, query: string) {
       {
         role: "system",
         content:
-          "You answer using ONLY the provided memories. If the memories don't contain the answer, say you don't know. Output JSON: {text:string}.",
+          "You answer using ONLY the provided memories. If the memories do not contain the answer, say you don't know. Output JSON: {text:string}.",
       },
       { role: "user", content: JSON.stringify({ query, candidates }, null, 2) },
     ],
   });
 
   const out = JSON.parse(resp.choices[0]?.message?.content || "{}");
-
   const sources =
     "\n\nSources:\n" +
     candidates
@@ -190,7 +244,6 @@ export const handler: Handler = async (event) => {
     }
 
     const text = (msg.text || msg.caption || "").trim();
-if (!text) return json(200, { ok: true });
 
 const metadata = {
   chat_id: chatId,
@@ -202,15 +255,41 @@ const metadata = {
   forward_from_chat: msg.forward_from_chat ? { id: msg.forward_from_chat.id, title: msg.forward_from_chat.title } : null,
 };
 
-// ✅ If user is clearly asking, answer without Claw (cheaper + reliable)
-if (msg.text && isQuery(text)) {
+// ✅ Fast path: if it's clearly a question, answer immediately (no Claw)
+if (msg.text && text && isQuery(text)) {
   const q = text.replace(/^\?/, "").replace(/^ask\s+/i, "").trim();
   const ans = await answerQuery(user.id, q);
   await telegramSend(chatId, ans);
   return json(200, { ok: true });
 }
 
-const decision = await clawDecide({ text, metadata });
+// --- Attachments (Phase 1) ---
+let pdfText: string | null = null;
+let visionCaption: string | null = null;
+
+const document = msg.document;
+const photos = msg.photo;
+
+// PDF
+if (document?.file_id && (document?.mime_type === "application/pdf" || String(document?.file_name || "").toLowerCase().endsWith(".pdf"))) {
+  const url = await telegramGetFileUrl(String(document.file_id));
+  if (url) pdfText = await extractPdfTextFromUrl(url);
+}
+
+// Image (pick the largest photo)
+if (Array.isArray(photos) && photos.length) {
+  const best = photos[photos.length - 1];
+  const url = await telegramGetFileUrl(String(best.file_id));
+  if (url) visionCaption = await captionImageUrl(url);
+}
+
+// Feed Claw with richer input (text + pdf + image caption)
+const decision = await clawDecide({
+  text: text || null,
+  pdfText,
+  visionCaption,
+  metadata,
+});
 
     if (decision.intent === "ignore") return json(200, { ok: true });
 
@@ -220,10 +299,11 @@ const decision = await clawDecide({ text, metadata });
     }
 
     if (decision.intent === "store") {
-  await storeMemory(user.id, decision, text || null);
+  const raw = [text, visionCaption ? `\n\n[Image]\n${visionCaption}` : "", pdfText ? `\n\n[PDF]\n${pdfText}` : ""]
+    .join("")
+    .trim();
 
-  // ask contact after first store if missing
-  if (!user.phone_e164) await telegramAskShareContact(chatId);
+  await storeMemory(user.id, decision, raw || null);
 
   if (decision.reply_text) {
     await telegramSend(chatId, decision.reply_text);
