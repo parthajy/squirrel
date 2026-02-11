@@ -142,21 +142,37 @@ async function clawDecide(input: {
   return JSON.parse(resp.choices[0]?.message?.content || "{}");
 }
 
-async function storeMemory(userId: string, decision: any, rawText: string | null) {
-  const toEmbed = `${decision.title}\n${decision.summary}\n${rawText ?? ""}`.slice(0, 6000);
+async function storeMemory(
+  userId: string,
+  decision: any,
+  rawText: string | null,
+  metadata: Record<string, any>
+) {
+  // Fallbacks (critical for attachments)
+  const title =
+    (decision.title && String(decision.title).trim()) ||
+    metadata.file_name ||
+    (metadata.kind === "pdf" ? "PDF Document" : metadata.kind === "image" ? "Image" : "Note");
+
+  const summary =
+    (decision.summary && String(decision.summary).trim()) ||
+    (metadata.kind === "pdf" ? "Saved a PDF." : metadata.kind === "image" ? "Saved an image." : (rawText || "").slice(0, 240));
+
+  const toEmbed = `${title}\n${summary}\n${rawText ?? ""}\n\nMETA:\n${JSON.stringify(metadata)}`.slice(0, 8000);
   const embedding = await embedText(toEmbed);
 
   const { data, error } = await adminSupabase
     .from("squirrel_memories")
     .insert({
       user_id: userId,
-      type: decision.memory_type,
-      title: decision.title,
-      summary: decision.summary,
+      type: decision.memory_type || metadata.kind || "note",
+      title,
+      summary,
       raw_text: rawText,
       tags: decision.tags ?? [],
       entities: decision.entities ?? [],
       embedding,
+      // store some lightweight metadata in raw_text and/or add a jsonb column later
     })
     .select("id")
     .single();
@@ -175,8 +191,18 @@ async function retrieve(userId: string, query: string) {
   if (error) throw error;
 
   const rows = (data as any[]) ?? [];
-  const strong = rows.filter((r) => (r.similarity ?? 0) >= 0.78);
-  return strong.length ? strong : rows.slice(0, 4);
+
+// Deduplicate by id/title
+const seen = new Set<string>();
+const deduped = rows.filter((r) => {
+  const k = String(r.id || r.title || "").trim();
+  if (!k || seen.has(k)) return false;
+  seen.add(k);
+  return true;
+});
+
+const strong = deduped.filter((r) => (r.similarity ?? 0) >= 0.78);
+return strong.length ? strong : deduped.slice(0, 4);
 }
 
 async function answerQuery(userId: string, query: string) {
@@ -194,7 +220,11 @@ async function answerQuery(userId: string, query: string) {
       {
         role: "system",
         content:
-          "You answer using ONLY the provided memories. If the memories do not contain the answer, say you don't know. Output JSON: {text:string}.",
+  "You are Squirrel, a personal memory assistant. Answer using ONLY the provided memories. " +
+  "Be specific: mention file names, captions, and concrete details. " +
+  "If the answer isn't present, say: 'I don’t know based on what you’ve saved yet.' " +
+  "Output JSON: {text:string}.",
+
       },
       { role: "user", content: JSON.stringify({ query, candidates }, null, 2) },
     ],
@@ -299,18 +329,30 @@ const decision = await clawDecide({
     }
 
     if (decision.intent === "store") {
-  const raw = [text, visionCaption ? `\n\n[Image]\n${visionCaption}` : "", pdfText ? `\n\n[PDF]\n${pdfText}` : ""]
-    .join("")
-    .trim();
+  const kind = pdfText ? "pdf" : visionCaption ? "image" : "note";
 
-  await storeMemory(user.id, decision, raw || null);
+  const file_name =
+    msg.document?.file_name ||
+    (kind === "image" ? "Telegram Photo" : null);
 
-  if (decision.reply_text) {
-    await telegramSend(chatId, decision.reply_text);
-  } else {
-    await telegramSend(chatId, "✅ Saved.");
-  }
+  const raw =
+    [
+      text ? `[Text]\n${text}` : "",
+      visionCaption ? `\n\n[Image Caption]\n${visionCaption}` : "",
+      pdfText ? `\n\n[PDF Text]\n${pdfText}` : "",
+      file_name ? `\n\n[File]\n${file_name}` : "",
+    ]
+      .join("")
+      .trim() || null;
 
+  await storeMemory(user.id, decision, raw, {
+    kind,
+    file_name,
+    mime_type: msg.document?.mime_type || null,
+    telegram: { chat_id: chatId, message_id: msg.message_id },
+  });
+
+  await telegramSend(chatId, "✅ Saved.");
   return json(200, { ok: true });
 }
 
